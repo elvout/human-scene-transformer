@@ -42,7 +42,7 @@ _OUTPUT_PATH = flags.DEFINE_string(
 
 _PROCESS_POINTCLOUDS = flags.DEFINE_bool(
     'process_pointclouds',
-    default=True,
+    default=False,
     help='Whether to process pointclouds.'
 )
 
@@ -61,7 +61,7 @@ _MAX_PC_DISTANCE_TO_ROBOT = flags.DEFINE_float(
 )
 
 
-AGENT_KEYPOINTS = True
+AGENT_KEYPOINTS = False
 FROM_DETECTIONS = True
 
 
