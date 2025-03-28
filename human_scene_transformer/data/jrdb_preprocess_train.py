@@ -16,7 +16,10 @@
 """
 
 import collections
+import concurrent.futures
+import itertools
 import json
+import multiprocessing
 import os
 from pathlib import Path
 
@@ -26,6 +29,7 @@ from absl import flags
 from human_scene_transformer.data import utils
 import numpy as np
 import pandas as pd
+import psutil
 import tensorflow as tf
 import tqdm
 
@@ -118,178 +122,195 @@ def get_agents_features(agents_dict, max_distance_to_robot=10):
   return agents_pos_dict
 
 
-def jrdb_preprocess_train(input_path, output_path):
+def jrdb_preprocess_train_worker(input_path, output_path, scene):
   """Preprocesses the raw train split of JRDB."""
 
   tf.keras.utils.set_random_seed(123)
 
   subsample = 1
 
-  scenes = utils.list_scenes(
-      os.path.join(input_path, 'train_dataset')
+  if not FROM_DETECTIONS:
+    agents_dict = get_agents_dict(
+      os.path.join(input_path, 'train_dataset'), scene
+    )
+  else:
+    agents_dict = get_agents_dict_from_detections(
+      os.path.join(input_path, 'processed'), scene
+    )
+
+  agents_features = utils.get_agents_features_with_box(
+    agents_dict, max_distance_to_robot=_MAX_DISTANCE_TO_ROBOT.value
   )
-  for scene in tqdm.tqdm(scenes):
-    if not FROM_DETECTIONS:
-      agents_dict = get_agents_dict(
-          os.path.join(input_path, 'train_dataset'), scene
-      )
-    else:
-      agents_dict = get_agents_dict_from_detections(
-          os.path.join(input_path, 'processed'), scene
-      )
 
-    agents_features = utils.get_agents_features_with_box(
-        agents_dict, max_distance_to_robot=_MAX_DISTANCE_TO_ROBOT.value
-    )
+  robot_odom = utils.get_robot(
+    os.path.join(input_path, 'processed', 'odometry', 'train'), scene
+  )
 
-    robot_odom = utils.get_robot(
-        os.path.join(input_path, 'processed', 'odometry', 'train'), scene
-    )
+  agents_df = pd.DataFrame.from_dict(
+    agents_features, orient='index'
+  ).rename_axis(['timestep', 'id'])  # pytype: disable=missing-parameter  # pandas-drop-duplicates-overloads
 
-    agents_df = pd.DataFrame.from_dict(
-        agents_features, orient='index'
-    ).rename_axis(['timestep', 'id'])  # pytype: disable=missing-parameter  # pandas-drop-duplicates-overloads
+  # if AGENT_KEYPOINTS:
+  #   keypoints = utils.get_agents_keypoints(
+  #       os.path.join(
+  #           input_path, 'processed', 'labels',
+  #           'labels_3d_keypoints', 'train'),
+  #       scene,
+  #   )
+  #   keypoints_df = pd.DataFrame.from_dict(
+  #       keypoints, orient='index'
+  #   ).rename_axis(['timestep', 'id'])  # pytype: disable=missing-parameter  # pandas-drop-duplicates-overloads
 
-    if AGENT_KEYPOINTS:
-      keypoints = utils.get_agents_keypoints(
-          os.path.join(
-              input_path, 'processed', 'labels',
-              'labels_3d_keypoints', 'train'),
-          scene,
-      )
-      keypoints_df = pd.DataFrame.from_dict(
-          keypoints, orient='index'
-      ).rename_axis(['timestep', 'id'])  # pytype: disable=missing-parameter  # pandas-drop-duplicates-overloads
+  #   agents_df = agents_df.join(keypoints_df)
+  #   agents_df.keypoints.fillna(
+  #       dict(
+  #           zip(
+  #               agents_df.index[agents_df['keypoints'].isnull()],
+  #               [np.ones((33, 3)) * np.nan]
+  #               * len(
+  #                   agents_df.loc[
+  #                       agents_df['keypoints'].isnull(), 'keypoints'
+  #                   ]
+  #               ),
+  #           )
+  #       ),
+  #       inplace=True,
+  #   )
 
-      agents_df = agents_df.join(keypoints_df)
-      agents_df.keypoints.fillna(
-          dict(
-              zip(
-                  agents_df.index[agents_df['keypoints'].isnull()],
-                  [np.ones((33, 3)) * np.nan]
-                  * len(
-                      agents_df.loc[
-                          agents_df['keypoints'].isnull(), 'keypoints'
-                      ]
-                  ),
-              )
-          ),
-          inplace=True,
-      )
+  robot_df = pd.DataFrame.from_dict(robot_odom, orient='index').rename_axis(  # pytype: disable=missing-parameter  # pandas-drop-duplicates-overloads
+    ['timestep']
+  )
+  # Remove extra data odometry datapoints
+  robot_df = robot_df.iloc[agents_df.index.levels[0]]
 
-    robot_df = pd.DataFrame.from_dict(robot_odom, orient='index').rename_axis(  # pytype: disable=missing-parameter  # pandas-drop-duplicates-overloads
-        ['timestep']
-    )
-    # Remove extra data odometry datapoints
-    robot_df = robot_df.iloc[agents_df.index.levels[0]]
+  assert (agents_df.index.levels[0] == robot_df.index).all()
 
-    assert (agents_df.index.levels[0] == robot_df.index).all()
+  # Subsample
+  assert len(agents_df.index.levels[0]) == agents_df.index.levels[0].max() + 1
+  agents_df_subsampled_index = agents_df.unstack('id').iloc[::subsample].index
+  agents_df = (
+    agents_df.unstack('id')
+    .iloc[::subsample]
+    .reset_index(drop=True)
+    .stack('id', dropna=True)
+  )
 
-    # Subsample
-    assert len(agents_df.index.levels[0]) == agents_df.index.levels[0].max() + 1
-    agents_df_subsampled_index = agents_df.unstack('id').iloc[::subsample].index
-    agents_df = (
-        agents_df.unstack('id')
-        .iloc[::subsample]
-        .reset_index(drop=True)
-        .stack('id', dropna=True)
-    )
+  agents_in_odometry_df = utils.agents_to_odometry_frame(
+    agents_df, robot_df.iloc[::subsample].reset_index(drop=True)
+  )
 
-    agents_in_odometry_df = utils.agents_to_odometry_frame(
-        agents_df, robot_df.iloc[::subsample].reset_index(drop=True)
-    )
+  # agents_pos_ragged_tensor = utils.agents_pos_to_ragged_tensor(
+  #     agents_in_odometry_df
+  # )
+  # agents_yaw_ragged_tensor = utils.agents_yaw_to_ragged_tensor(
+  #     agents_in_odometry_df
+  # )
+  # assert (
+  #     agents_pos_ragged_tensor.shape[0] == agents_yaw_ragged_tensor.shape[0]
+  # )
 
-    # agents_pos_ragged_tensor = utils.agents_pos_to_ragged_tensor(
-    #     agents_in_odometry_df
-    # )
-    # agents_yaw_ragged_tensor = utils.agents_yaw_to_ragged_tensor(
-    #     agents_in_odometry_df
-    # )
-    # assert (
-    #     agents_pos_ragged_tensor.shape[0] == agents_yaw_ragged_tensor.shape[0]
-    # )
+  # tf.data.Dataset.from_tensors(agents_pos_ragged_tensor).save(
+  #     os.path.join(output_path, scene, 'agents', 'position')
+  # )
+  # tf.data.Dataset.from_tensors(agents_yaw_ragged_tensor).save(
+  #     os.path.join(output_path, scene, 'agents', 'orientation')
+  # )
 
-    # tf.data.Dataset.from_tensors(agents_pos_ragged_tensor).save(
-    #     os.path.join(output_path, scene, 'agents', 'position')
-    # )
-    # tf.data.Dataset.from_tensors(agents_yaw_ragged_tensor).save(
-    #     os.path.join(output_path, scene, 'agents', 'orientation')
-    # )
+  agents_se2_pose = utils.agents_se2_pose_to_numpy(agents_in_odometry_df)
+  agents_se2_pose_save_path = Path(output_path) / scene / "agents" / "se2_pose.npy"
+  agents_se2_pose_save_path.parent.mkdir(parents=True, exist_ok=True)
+  np.save(agents_se2_pose_save_path, agents_se2_pose)
 
-    agents_se2_pose = utils.agents_se2_pose_to_numpy(agents_in_odometry_df)
-    agents_se2_pose_save_path = Path(output_path) / scene / "agents" / "se2_pose.npy"
-    agents_se2_pose_save_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(agents_se2_pose_save_path, agents_se2_pose)
+  # if AGENT_KEYPOINTS:
+  #   agents_keypoints_ragged_tensor = utils.agents_keypoints_to_ragged_tensor(
+  #       agents_in_odometry_df
+  #   )
+  #   tf.data.Dataset.from_tensors(agents_keypoints_ragged_tensor).save(
+  #       os.path.join(output_path, scene, 'agents', 'keypoints')
+  #   )
 
-    if AGENT_KEYPOINTS:
-      agents_keypoints_ragged_tensor = utils.agents_keypoints_to_ragged_tensor(
-          agents_in_odometry_df
-      )
-      tf.data.Dataset.from_tensors(agents_keypoints_ragged_tensor).save(
-          os.path.join(output_path, scene, 'agents', 'keypoints')
-      )
+  robot_in_odometry_df = utils.robot_to_odometry_frame(robot_df)
+  robot_se2_pose = np.hstack((
+    # XY components of position
+    np.vstack(robot_in_odometry_df.to_numpy()[:, 0]).astype(np.float32)[:, :2],
+    # Yaw
+    robot_in_odometry_df.to_numpy()[:, 1].astype(np.float32)[:, np.newaxis],
+  ))
+  assert robot_se2_pose.shape == (agents_se2_pose.shape[0], 3)
+  robot_se2_pose_save_path = Path(output_path) / scene / "robot" / "se2_pose.npy"
+  robot_se2_pose_save_path.parent.mkdir(parents=True, exist_ok=True)
+  np.save(robot_se2_pose_save_path, robot_se2_pose)
 
-    robot_in_odometry_df = utils.robot_to_odometry_frame(robot_df)
-    robot_se2_pose = np.hstack((
-      # XY components of position
-      np.vstack(robot_in_odometry_df.to_numpy()[:, 0]).astype(np.float32)[:, :2],
-      # Yaw
-      robot_in_odometry_df.to_numpy()[:, 1].astype(np.float32)[:, np.newaxis],
-    ))
-    assert robot_se2_pose.shape == (agents_se2_pose.shape[0], 3)
-    robot_se2_pose_save_path = Path(output_path) / scene / "robot" / "se2_pose.npy"
-    robot_se2_pose_save_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(robot_se2_pose_save_path, robot_se2_pose)
+  # robot_pos = tf.convert_to_tensor(
+  #     np.stack(robot_in_odometry_df.iloc[::subsample]['p'].values).astype(
+  #         np.float32
+  #     )
+  # )
+  # robot_orientation = tf.convert_to_tensor(
+  #     np.stack(robot_in_odometry_df.iloc[::subsample]['yaw'].values).astype(
+  #         np.float32
+  #     )
+  # )[..., tf.newaxis]
 
-    # robot_pos = tf.convert_to_tensor(
-    #     np.stack(robot_in_odometry_df.iloc[::subsample]['p'].values).astype(
-    #         np.float32
-    #     )
-    # )
-    # robot_orientation = tf.convert_to_tensor(
-    #     np.stack(robot_in_odometry_df.iloc[::subsample]['yaw'].values).astype(
-    #         np.float32
-    #     )
-    # )[..., tf.newaxis]
+  # tf.data.Dataset.from_tensors(robot_pos).save(
+  #     os.path.join(output_path, scene, 'robot', 'position')
+  # )
+  # tf.data.Dataset.from_tensors(robot_orientation).save(
+  #     os.path.join(output_path, scene, 'robot', 'orientation')
+  # )
 
-    # tf.data.Dataset.from_tensors(robot_pos).save(
-    #     os.path.join(output_path, scene, 'robot', 'position')
-    # )
-    # tf.data.Dataset.from_tensors(robot_orientation).save(
-    #     os.path.join(output_path, scene, 'robot', 'orientation')
-    # )
+  # if _PROCESS_POINTCLOUDS.value:
+  #     scene_pointcloud_dict = utils.get_scene_poinclouds(
+  #         os.path.join(input_path, 'train_dataset'),
+  #         scene,
+  #         subsample=subsample,
+  #     )
 
-    if _PROCESS_POINTCLOUDS.value:
-      scene_pointcloud_dict = utils.get_scene_poinclouds(
-          os.path.join(input_path, 'train_dataset'),
-          scene,
-          subsample=subsample,
-      )
+  #     # Remove extra timesteps
+  #     scene_pointcloud_dict = {
+  #         ts: scene_pointcloud_dict[ts] for ts in agents_df_subsampled_index
+  #     }
 
-      # Remove extra timesteps
-      scene_pointcloud_dict = {
-          ts: scene_pointcloud_dict[ts] for ts in agents_df_subsampled_index
-      }
+  #     scene_pc_odometry = utils.pc_to_odometry_frame(
+  #         scene_pointcloud_dict, robot_df
+  #     )
 
-      scene_pc_odometry = utils.pc_to_odometry_frame(
-          scene_pointcloud_dict, robot_df
-      )
+  #     filtered_pc = utils.filter_agents_and_ground_from_point_cloud(
+  #         agents_in_odometry_df, scene_pc_odometry, robot_in_odometry_df,
+  #         max_dist=_MAX_PC_DISTANCE_TO_ROBOT.value,
+  #     )
 
-      filtered_pc = utils.filter_agents_and_ground_from_point_cloud(
-          agents_in_odometry_df, scene_pc_odometry, robot_in_odometry_df,
-          max_dist=_MAX_PC_DISTANCE_TO_ROBOT.value,
-      )
+  #     scene_pc_ragged_tensor = tf.ragged.stack(filtered_pc)
 
-      scene_pc_ragged_tensor = tf.ragged.stack(filtered_pc)
+  #     assert (
+  #         agents_pos_ragged_tensor.bounding_shape()[1]
+  #         == scene_pc_ragged_tensor.shape[0]
+  #     )
 
-      assert (
-          agents_pos_ragged_tensor.bounding_shape()[1]
-          == scene_pc_ragged_tensor.shape[0]
-      )
+  #     tf.data.Dataset.from_tensors(scene_pc_ragged_tensor).save(
+  #         os.path.join(output_path, scene, 'scene', 'pc'), compression='GZIP'
+  #     )
 
-      tf.data.Dataset.from_tensors(scene_pc_ragged_tensor).save(
-          os.path.join(output_path, scene, 'scene', 'pc'), compression='GZIP'
-      )
+
+def jrdb_preprocess_train(input_path, output_path):
+  """Preprocesses the raw train split of JRDB."""
+
+  scenes = utils.list_scenes(os.path.join(input_path, "train_dataset"))
+  with concurrent.futures.ProcessPoolExecutor(
+    psutil.cpu_count(logical=False),
+    # incompatible with "spawn" due to flags being stored in global scope
+    mp_context=multiprocessing.get_context("fork"),
+  ) as executor:
+    for _ in tqdm.tqdm(
+      executor.map(
+        jrdb_preprocess_train_worker,
+        itertools.repeat(input_path, len(scenes)),
+        itertools.repeat(output_path, len(scenes)),
+        scenes,
+      ),
+      total=len(scenes),
+    ):
+      pass
 
 
 def main(argv):
