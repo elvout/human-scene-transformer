@@ -18,6 +18,7 @@
 import collections
 import json
 import os
+from pathlib import Path
 
 from absl import app
 from absl import flags
@@ -198,22 +199,27 @@ def jrdb_preprocess_train(input_path, output_path):
         agents_df, robot_df.iloc[::subsample].reset_index(drop=True)
     )
 
-    agents_pos_ragged_tensor = utils.agents_pos_to_ragged_tensor(
-        agents_in_odometry_df
-    )
-    agents_yaw_ragged_tensor = utils.agents_yaw_to_ragged_tensor(
-        agents_in_odometry_df
-    )
-    assert (
-        agents_pos_ragged_tensor.shape[0] == agents_yaw_ragged_tensor.shape[0]
-    )
+    # agents_pos_ragged_tensor = utils.agents_pos_to_ragged_tensor(
+    #     agents_in_odometry_df
+    # )
+    # agents_yaw_ragged_tensor = utils.agents_yaw_to_ragged_tensor(
+    #     agents_in_odometry_df
+    # )
+    # assert (
+    #     agents_pos_ragged_tensor.shape[0] == agents_yaw_ragged_tensor.shape[0]
+    # )
 
-    tf.data.Dataset.from_tensors(agents_pos_ragged_tensor).save(
-        os.path.join(output_path, scene, 'agents', 'position')
-    )
-    tf.data.Dataset.from_tensors(agents_yaw_ragged_tensor).save(
-        os.path.join(output_path, scene, 'agents', 'orientation')
-    )
+    # tf.data.Dataset.from_tensors(agents_pos_ragged_tensor).save(
+    #     os.path.join(output_path, scene, 'agents', 'position')
+    # )
+    # tf.data.Dataset.from_tensors(agents_yaw_ragged_tensor).save(
+    #     os.path.join(output_path, scene, 'agents', 'orientation')
+    # )
+
+    agents_se2_pose = utils.agents_se2_pose_to_numpy(agents_in_odometry_df)
+    agents_se2_pose_save_path = Path(output_path) / scene / "agents" / "se2_pose.npy"
+    agents_se2_pose_save_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(agents_se2_pose_save_path, agents_se2_pose)
 
     if AGENT_KEYPOINTS:
       agents_keypoints_ragged_tensor = utils.agents_keypoints_to_ragged_tensor(
@@ -224,23 +230,34 @@ def jrdb_preprocess_train(input_path, output_path):
       )
 
     robot_in_odometry_df = utils.robot_to_odometry_frame(robot_df)
-    robot_pos = tf.convert_to_tensor(
-        np.stack(robot_in_odometry_df.iloc[::subsample]['p'].values).astype(
-            np.float32
-        )
-    )
-    robot_orientation = tf.convert_to_tensor(
-        np.stack(robot_in_odometry_df.iloc[::subsample]['yaw'].values).astype(
-            np.float32
-        )
-    )[..., tf.newaxis]
+    robot_se2_pose = np.hstack((
+      # XY components of position
+      np.vstack(robot_in_odometry_df.to_numpy()[:, 0]).astype(np.float32)[:, :2],
+      # Yaw
+      robot_in_odometry_df.to_numpy()[:, 1].astype(np.float32)[:, np.newaxis],
+    ))
+    assert robot_se2_pose.shape == (agents_se2_pose.shape[0], 3)
+    robot_se2_pose_save_path = Path(output_path) / scene / "robot" / "se2_pose.npy"
+    robot_se2_pose_save_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(robot_se2_pose_save_path, robot_se2_pose)
 
-    tf.data.Dataset.from_tensors(robot_pos).save(
-        os.path.join(output_path, scene, 'robot', 'position')
-    )
-    tf.data.Dataset.from_tensors(robot_orientation).save(
-        os.path.join(output_path, scene, 'robot', 'orientation')
-    )
+    # robot_pos = tf.convert_to_tensor(
+    #     np.stack(robot_in_odometry_df.iloc[::subsample]['p'].values).astype(
+    #         np.float32
+    #     )
+    # )
+    # robot_orientation = tf.convert_to_tensor(
+    #     np.stack(robot_in_odometry_df.iloc[::subsample]['yaw'].values).astype(
+    #         np.float32
+    #     )
+    # )[..., tf.newaxis]
+
+    # tf.data.Dataset.from_tensors(robot_pos).save(
+    #     os.path.join(output_path, scene, 'robot', 'position')
+    # )
+    # tf.data.Dataset.from_tensors(robot_orientation).save(
+    #     os.path.join(output_path, scene, 'robot', 'orientation')
+    # )
 
     if _PROCESS_POINTCLOUDS.value:
       scene_pointcloud_dict = utils.get_scene_poinclouds(

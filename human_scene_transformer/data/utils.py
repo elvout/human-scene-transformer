@@ -231,6 +231,32 @@ def agents_pos_to_ragged_tensor(agents_df):
   return tf.stack(tensor_list)
 
 
+def agents_se2_pose_to_numpy(agents_df):
+  """Return (T, N, 3) np.float32 array with NaNs."""
+  T = int(agents_df.iloc[-1].name[0]) + 1
+  id_to_track: dict[int, np.ndarray] = collections.defaultdict(
+    lambda: np.full((T, 3), np.nan, dtype=np.float32)
+  )
+
+  for record in agents_df.itertuples():
+    t = record[0][0]
+    id = int(record[0][1].split(":")[1])
+    position = record[1]
+    yaw = record[2]
+
+    id_to_track[id][t][:2] = position[:2]
+    id_to_track[id][t][2] = yaw
+
+  se2_pose = np.stack(list(id_to_track.values()), axis=1)
+  # Sort by ascending person ID. Probably not strictly necessary, but might
+  # help with visualization and debugging.
+  se2_pose = se2_pose[:, np.argsort(list(id_to_track.keys()))]
+
+  assert se2_pose.shape == (T, len(id_to_track), 3)
+  assert se2_pose.dtype == np.float32
+  return se2_pose
+
+
 def agents_yaw_to_ragged_tensor(agents_df):
   tensor_list = []
   for _, df in agents_df.groupby('id'):
@@ -291,4 +317,3 @@ def filter_agents_and_ground_from_point_cloud(
     np.random.shuffle(pc_points)
     pointcloud_dict[t] = pc_points
   return pointcloud_dict
-
